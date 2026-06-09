@@ -82,3 +82,87 @@
 - Легко знаходити спільне між фільмами. «Фільми одного жанру» — це короткий шаблон `(m1)-[:HAS_GENRE]->(g)<-[:HAS_GENRE]-(m2)`. Зі списками довелося б порівнювати рядки в кожної пари фільмів.
 - Немає дублювання. Замість слова 'Action' у тисячах фільмів (де одна одруківка тихо створює ще один жанр) є 18 вузлів, на які всі посилаються.
 - Згодиться далі. Через спільні жанри зручно робити рекомендації й запускати алгоритми GDS у частинах 4–5. До того ж популярні жанри (Drama, Comedy) стають супервузлами — саме їх розбираємо в частині 4.
+
+---
+
+# Частина 2 — Завантаження даних
+
+Усі запити лежать у [`queries/part2_load.cypher`](queries/part2_load.cypher). Вихідні `.dat` уже сконвертовані в CSV скриптом [`convert.py`](convert.py) (роздільник кома, кодування UTF-8). Запустити завантаження можна так:
+
+```
+cypher-shell -u neo4j -p password123 -f part2_load.cypher
+```
+
+Теку `./import` змонтовано в контейнер як import-каталог Neo4j, тому шляхи у `LOAD CSV` короткі — `file:///users.csv`. Спершу обмеження, потім вузли, насамкінець оцінки.
+
+## Обмеження унікальності
+
+```cypher
+CREATE CONSTRAINT user_id  IF NOT EXISTS FOR (u:User)  REQUIRE u.userId  IS UNIQUE;
+CREATE CONSTRAINT movie_id IF NOT EXISTS FOR (m:Movie) REQUIRE m.movieId IS UNIQUE;
+CREATE CONSTRAINT genre_nm IF NOT EXISTS FOR (g:Genre) REQUIRE g.name    IS UNIQUE;
+```
+
+Створюю їх найпершими, ще до вузлів. По-перше, це не дасть з'явитися двом користувачам з одним userId чи двом однаковим жанрам. По-друге, і це головне для швидкості, обмеження унікальності в Neo4j автоматично створює індекс на цій властивості. Завдяки цьому і MERGE вузлів нижче, і MATCH під час завантаження мільйона оцінок шукають по індексу, а не перебирають усі вузли. `IF NOT EXISTS` дає змогу перезапускати скрипт без помилки «обмеження вже існує».
+
+## Вузли User
+
+```cypher
+LOAD CSV WITH HEADERS FROM 'file:///users.csv' AS row
+MERGE (u:User {userId: toInteger(row.userId)})
+SET u.gender     = row.gender,
+    u.age        = toInteger(row.age),
+    u.occupation = toInteger(row.occupation);
+```
+
+`LOAD CSV WITH HEADERS` читає файл і віддає кожен рядок як мапу з ключами-заголовками (`row.userId` і так далі). Значення з CSV завжди приходять рядками, тому числові поля обгортаю в `toInteger` — інакше userId зберігся б як текст і не зійшовся б з оцінками. `MERGE` шукає користувача за userId і створює його, лише якщо такого ще немає, тож повторний запуск не наплодить дублів. `SET` дописує решту властивостей.
+
+## Вузли Movie, жанри й ребра HAS_GENRE
+
+```cypher
+LOAD CSV WITH HEADERS FROM 'file:///movies.csv' AS row
+MERGE (m:Movie {movieId: toInteger(row.movieId)})
+SET m.title = row.title,
+    m.year  = toInteger(substring(row.title, size(row.title) - 5, 4))
+WITH m, row
+UNWIND split(row.genres, '|') AS genreName
+MERGE (g:Genre {name: genreName})
+MERGE (m)-[:HAS_GENRE]->(g);
+```
+
+За один прохід по файлу робиться три речі. Спершу MERGE створює фільм. Окремого поля з роком у даних немає, але всі назви закінчуються на «(рррр)» (перевірив — так у всіх 3883 рядках), тому витягую рік як чотири символи перед останньою дужкою через `substring(title, size(title) - 5, 4)`. Далі `split(row.genres, '|')` розбиває рядок жанрів на список, `UNWIND` розгортає список в окремі рядки, і для кожного жанру MERGE створює або знаходить вузол `Genre` та зв'язок `HAS_GENRE`. Оскільки MERGE шукає жанр за іменем, усі бойовики чіпляються до одного спільного вузла Action, а не плодять копії.
+
+## Індекси
+
+Окремого `CREATE INDEX` тут немає навмисно. Індекси, потрібні для швидкого пошуку вузлів при завантаженні оцінок, уже є — їх дали обмеження унікальності з першого кроку (обмеження = перевірка + індекс). Ще один індекс на тих самих властивостях був би зайвий.
+
+## Ребра RATED — батчами через APOC
+
+```cypher
+CALL apoc.periodic.iterate(
+  'LOAD CSV WITH HEADERS FROM "file:///ratings.csv" AS row RETURN row',
+  'MATCH (u:User  {userId:  toInteger(row.userId)})
+   MATCH (m:Movie {movieId: toInteger(row.movieId)})
+   MERGE (u)-[r:RATED]->(m)
+   SET r.rating    = toInteger(row.rating),
+       r.timestamp = toInteger(row.timestamp)',
+  {batchSize: 10000, parallel: false}
+);
+```
+
+Оцінок мільйон з гаком. Якщо лити їх однією транзакцією, Neo4j тримає всі зміни в пам'яті до коміту й падає по таймауту або браку пам'яті. `apoc.periodic.iterate` розв'язує це поділом на батчі. Перший запит (зовнішній) лише читає рядки, другий (внутрішній) виконується для кожного рядка, а `batchSize: 10000` комітить роботу пачками по 10 тисяч — кожна пачка окрема транзакція, пам'ять не росте.
+
+Внутрішній запит знаходить уже наявні вузли через MATCH (вони створені на кроках 1–2) і з'єднує їх ребром. Ребро роблю через MERGE, а не CREATE, з тієї ж причини, що й усе інше — щоб повторний запуск не додав другий такий самий зв'язок.
+
+`parallel: false` обрано свідомо. Вузли я лише читаю (MATCH), але саме ребро створюю через MERGE, а воно бере блокування на обидва кінці. Популярний фільм трапляється в багатьох батчах водночас, тож паралельні потоки чіплялися б за той самий вузол і могли б зайти в дедлок. Послідовно повільніше, зате надійно.
+
+## Перевірка
+
+```cypher
+MATCH (u:User)         RETURN count(u) AS users;
+MATCH (m:Movie)        RETURN count(m) AS movies;
+MATCH (g:Genre)        RETURN count(g) AS genres;
+MATCH ()-[r:RATED]->() RETURN count(r) AS ratings;
+```
+
+Має вийти 6040 користувачів, 3883 фільми, 18 жанрів і 1 000 209 оцінок. Якщо числа збігаються — дані завантажилися без втрат.
